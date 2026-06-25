@@ -1,10 +1,11 @@
-// Powered by OnSpace.AI
-import React, { createContext, useState, ReactNode, useCallback, useMemo } from 'react';
+import React, { createContext, useState, ReactNode, useCallback, useMemo, useEffect, useRef } from 'react';
+import { supabase } from '@/services/supabaseClient';
 import {
   RestaurantStatus, MenuItem, Order, Rider, RestaurantInfo,
   OrderStatus, StaffMember, DailyReport,
   MOCK_RESTAURANT, MOCK_MENU_ITEMS, MOCK_ORDERS, MOCK_RIDERS, MOCK_STAFF, MOCK_DAILY_REPORTS,
 } from '@/services/mockData';
+import { useAuth } from '@/hooks/useAuth';
 
 interface FinancialSummary {
   todayGross: number;
@@ -23,6 +24,7 @@ interface RestaurantContextType {
   staff: StaffMember[];
   dailyReports: DailyReport[];
   financials: FinancialSummary;
+  loading: boolean;
   setRestaurantStatus: (status: RestaurantStatus) => void;
   updateRestaurant: (info: Partial<RestaurantInfo>) => void;
   addMenuItem: (item: Omit<MenuItem, 'id'>) => void;
@@ -44,16 +46,122 @@ interface RestaurantContextType {
 export const RestaurantContext = createContext<RestaurantContextType | undefined>(undefined);
 
 export function RestaurantProvider({ children }: { children: ReactNode }) {
+  const { user } = useAuth();
   const [restaurant, setRestaurant] = useState<RestaurantInfo>(MOCK_RESTAURANT);
   const [menuItems, setMenuItems] = useState<MenuItem[]>(MOCK_MENU_ITEMS);
   const [orders, setOrders] = useState<Order[]>(MOCK_ORDERS);
   const [riders, setRiders] = useState<Rider[]>(MOCK_RIDERS);
   const [staff, setStaff] = useState<StaffMember[]>(MOCK_STAFF);
   const [dailyReports, setDailyReports] = useState<DailyReport[]>(MOCK_DAILY_REPORTS);
+  const [loading, setLoading] = useState(true);
+  const channelRef = useRef<any>(null);
+
+  // ─── Real-time subscription for orders ───────────────────────────────────────
+  useEffect(() => {
+    if (!user) {
+      setLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setLoading(true);
+
+    // Fetch orders for this restaurant from Supabase
+    (async () => {
+      try {
+        const { data, error } = await supabase
+          .from('orders')
+          .select('*')
+          .eq('restaurant_id', user.id)
+          .order('created_at', { ascending: false });
+
+        if (!cancelled && !error && data) {
+          // Map Supabase rows to Order shape
+          const mappedOrders = data.map((row: any) => ({
+            id: row.id,
+            customerId: row.customer_id,
+            restaurantId: row.restaurant_id,
+            status: row.status as OrderStatus,
+            total: row.total_amount || 0,
+            adminCommission: row.commission_amount || 0,
+            items: row.items || [],
+            customerName: row.customer_name || 'عميل',
+            customerPhone: row.customer_phone || '',
+            customerAddress: row.customer_address || '',
+            riderId: row.driver_id,
+            createdAt: new Date(row.created_at),
+            updatedAt: new Date(row.updated_at),
+          }));
+          setOrders(mappedOrders);
+        }
+        setLoading(false);
+      } catch (err) {
+        console.error('Failed to fetch orders:', err);
+        setLoading(false);
+      }
+    })();
+
+    // Subscribe to real-time changes for this restaurant's orders
+    const channel = supabase
+      .channel(`restaurant-orders-${user.id}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'orders',
+          filter: `restaurant_id=eq.${user.id}`,
+        },
+        (payload: any) => {
+          if (payload.eventType === 'DELETE') {
+            const oldId = payload.old?.id;
+            if (oldId) {
+              setOrders((prev) => prev.filter((p) => p.id !== oldId));
+            }
+            return;
+          }
+
+          const mappedOrder = {
+            id: payload.new.id,
+            customerId: payload.new.customer_id,
+            restaurantId: payload.new.restaurant_id,
+            status: payload.new.status as OrderStatus,
+            total: payload.new.total_amount || 0,
+            adminCommission: payload.new.commission_amount || 0,
+            items: payload.new.items || [],
+            customerName: payload.new.customer_name || 'عميل',
+            customerPhone: payload.new.customer_phone || '',
+            customerAddress: payload.new.customer_address || '',
+            riderId: payload.new.driver_id,
+            createdAt: new Date(payload.new.created_at),
+            updatedAt: new Date(payload.new.updated_at),
+          };
+
+          setOrders((prev) => {
+            const idx = prev.findIndex((p) => p.id === mappedOrder.id);
+            if (idx < 0) return [mappedOrder, ...prev];
+            const copy = [...prev];
+            copy[idx] = mappedOrder;
+            return copy;
+          });
+        }
+      )
+      .subscribe();
+
+    channelRef.current = channel;
+
+    return () => {
+      cancelled = true;
+      if (channelRef.current) {
+        supabase.removeChannel(channelRef.current);
+        channelRef.current = null;
+      }
+    };
+  }, [user]);
 
   // ─── Financial Summary (today's data from current orders) ───────────────────
   const financials = useMemo((): FinancialSummary => {
-    const todayOrders = orders; // In mock, all orders count as "today"
+    const todayOrders = orders;
     const completed = todayOrders.filter(o => o.status === 'delivered');
     const cancelled = todayOrders.filter(o => o.status === 'cancelled');
     const gross = completed.reduce((s, o) => s + o.total, 0);
@@ -96,6 +204,7 @@ export function RestaurantProvider({ children }: { children: ReactNode }) {
 
   // ─── Orders ─────────────────────────────────────────────────────────────────
   const updateOrderStatus = useCallback((orderId: string, status: OrderStatus) => {
+    // Update locally first
     setOrders(prev => {
       const updated = prev.map(o =>
         o.id === orderId ? { ...o, status, updatedAt: new Date() } : o
@@ -112,25 +221,26 @@ export function RestaurantProvider({ children }: { children: ReactNode }) {
       }
       return updated;
     });
+
+    // Push to Supabase
+    supabase
+      .from('orders')
+      .update({ status })
+      .eq('id', orderId)
+      .catch(err => console.error('Failed to update order status:', err));
   }, []);
 
   const acceptOrder = useCallback((orderId: string) => {
-    setOrders(prev => prev.map(o =>
-      o.id === orderId ? { ...o, status: 'accepted' as OrderStatus, updatedAt: new Date() } : o
-    ));
-  }, []);
+    updateOrderStatus(orderId, 'accepted' as OrderStatus);
+  }, [updateOrderStatus]);
 
   const rejectOrder = useCallback((orderId: string) => {
-    setOrders(prev => prev.map(o =>
-      o.id === orderId ? { ...o, status: 'cancelled' as OrderStatus, updatedAt: new Date() } : o
-    ));
-  }, []);
+    updateOrderStatus(orderId, 'cancelled' as OrderStatus);
+  }, [updateOrderStatus]);
 
   const markOrderReady = useCallback((orderId: string) => {
-    setOrders(prev => prev.map(o =>
-      o.id === orderId ? { ...o, status: 'ready' as OrderStatus, updatedAt: new Date() } : o
-    ));
-  }, []);
+    updateOrderStatus(orderId, 'ready' as OrderStatus);
+  }, [updateOrderStatus]);
 
   // ─── Riders ─────────────────────────────────────────────────────────────────
   const updateRiderVisibility = useCallback((riderId: string, visible: boolean) => {
@@ -194,7 +304,7 @@ export function RestaurantProvider({ children }: { children: ReactNode }) {
 
   return (
     <RestaurantContext.Provider value={{
-      restaurant, menuItems, orders, riders, staff, dailyReports, financials,
+      restaurant, menuItems, orders, riders, staff, dailyReports, financials, loading,
       setRestaurantStatus, updateRestaurant,
       addMenuItem, updateMenuItem, deleteMenuItem, toggleItemAvailability,
       updateOrderStatus, acceptOrder, rejectOrder, markOrderReady,
