@@ -31,7 +31,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const { data: users, error } = await getClient()
         .from('users')
         .select('*')
-        .or(`email.eq.${emailOrUsername},name.eq.${emailOrUsername}`)
+        .or(`email.eq.${emailOrUsername},name.eq.${emailOrUsername},username.eq.${emailOrUsername}`)
         .limit(1);
 
       if (error || !users || users.length === 0) {
